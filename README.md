@@ -65,7 +65,8 @@ ClinicBot/
 - **QA**: pruebas y evidencias.
 
 ## 🧩 Kanban
-- GitHub Projects / Trello: _(agrega el enlace aquí)_
+- [Tablero de seguimiento ClinicBot – Semana 1](https://github.com/users/jhoanrrdev/projects/1)
+
 
 ## 🔗 URLs de staging
 - Backend (Render/Railway): _(URL aquí)_
