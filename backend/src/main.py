@@ -266,8 +266,8 @@ def build_start_end_datetime(date_value: str, time_value: str, duration_minutes:
     start_dt = datetime.strptime(f"{date_value} {time_value}", "%Y-%m-%d %H:%M")
     end_dt = start_dt + timedelta(minutes=duration_minutes)
     return (
-        start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
     )
 
 
@@ -282,6 +282,12 @@ def extract_patient_from_result(data):
         return data[0]
 
     return None
+
+
+def is_canceled_appointment(appt) -> bool:
+    text = str(appt.get("text") or "").lower()
+    observations = str(appt.get("observations") or "").lower()
+    return "cancelad" in text or "cancelad" in observations
 
 
 # ======================================================
@@ -426,6 +432,9 @@ def list_future_appointments_by_patient(patient_id: int):
     future = []
 
     for appt in items:
+        if is_canceled_appointment(appt):
+            continue
+
         customer = appt.get("customer")
         customer_id = None
 
@@ -461,6 +470,9 @@ def list_appointments_by_calendar_and_date(calendar_id: int, date_str: str):
     result = []
 
     for appt in items:
+        if is_canceled_appointment(appt):
+            continue
+
         cal = appt.get("calendar")
         cal_id = None
 
@@ -693,7 +705,7 @@ def process_message(sender: str, text: str, db: Session):
 
         session["state"] = "MENU"
 
-        if status_cancel in [200, 202]:
+        if status_cancel in [200, 202, 204]:
             mark_booking_completed(session)
             return "✅ Tu cita fue cancelada.\n\n" + menu_text()
 
@@ -836,7 +848,7 @@ def process_message(sender: str, text: str, db: Session):
             status_cancel, data_cancel = cancel_appointment_in_sofisis(appointment_id)
 
             session["state"] = "MENU"
-            if status_cancel in [200, 202]:
+            if status_cancel in [200, 202, 204]:
                 mark_booking_completed(session)
                 return "✅ Tu cita fue cancelada.\n\n" + menu_text()
 
@@ -1040,7 +1052,47 @@ def process_message(sender: str, text: str, db: Session):
                         f"{menu_text()}"
                     )
 
-                return f"⚠️ No se pudo reprogramar la cita.\nDetalle: {upd_data}\n\n{menu_text()}"
+                print("Update appointment failed, falling back to create+cancel flow")
+                status_new, new_appt = create_appointment_in_sofisis(
+                    calendar_id=calendar_id,
+                    patient_id=patient_id,
+                    patient_cell=patient_cell,
+                    user_transaction_cell=patient_cell,
+                    doctor_owner_calendar_cell=doctor_cell,
+                    calendar_user_full_name=doctor_name,
+                    calendar_user_sex=doctor_sex,
+                    calendar_branch_name=calendar_branch_name,
+                    text=f"Reprogramada desde ClinicBot - {session.get('identification', '').strip()}",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+                if status_new in [200, 201] and isinstance(new_appt, dict) and new_appt.get("id"):
+                    status_cancel_old, cancel_old_data = cancel_appointment_in_sofisis(appointment_id)
+                    mark_booking_completed(session)
+
+                    if status_cancel_old in [200, 202, 204]:
+                        return (
+                            "✅ ¡Tu cita fue reprogramada en Sofisis!\n\n"
+                            f"👤 Paciente: {session.get('sofisis_patient_label')}\n"
+                            f"📅 Fecha: {date_value}\n"
+                            f"⏰ Hora: {time_value}\n"
+                            f"👨‍⚕️ Profesional: {doctor_name}\n"
+                            f"🏥 Agenda: {calendar_label}\n"
+                            f"🏢 Sucursal: {calendar_branch_name}\n"
+                            f"🆔 Nueva cita ID: {new_appt.get('id')}\n\n"
+                            "ℹ️ La cita anterior fue cancelada automáticamente.\n\n"
+                            f"{menu_text()}"
+                        )
+
+                    return (
+                        "⚠️ La nueva cita sí fue creada, pero no pude cancelar la anterior automáticamente.\n\n"
+                        f"🆔 Nueva cita ID: {new_appt.get('id')}\n"
+                        f"Detalle cancelación anterior: {cancel_old_data}\n\n"
+                        f"{menu_text()}"
+                    )
+
+                return f"⚠️ No se pudo reprogramar la cita.\nDetalle update: {upd_data}\nDetalle create: {new_appt}\n\n{menu_text()}"
 
             # CREAR NUEVA
             status_appt, appointment_data = create_appointment_in_sofisis(

@@ -108,6 +108,26 @@ class SofisisAPI:
         print("✅ PUT DATA:", data)
         return r.status_code, data
 
+    def _delete(self, endpoint):
+        url = f"{self.base_url}/api/v1/{endpoint.lstrip('/')}"
+        print("🌐 DELETE:", url)
+
+        r = requests.delete(
+            url,
+            headers=self.headers,
+            verify=self.verify_ssl,
+            timeout=30
+        )
+
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+
+        print("✅ DELETE STATUS:", r.status_code)
+        print("✅ DELETE DATA:", data)
+        return r.status_code, data
+
     # ======================================================
     # PACIENTES
     # ======================================================
@@ -298,10 +318,19 @@ class SofisisAPI:
             "start_date": start_date,
             "end_date": end_date,
         }
-        return self._put(f"schedule/appointment/{appointment_id}/", payload)
+        status, data = self._put(f"schedule/appointment/{appointment_id}/", payload)
+
+        # Some Sofisis deployments reject PUT updates for appointment reschedules
+        # even when the same payload succeeds on create. Retry with PATCH so the
+        # bot can keep working without user intervention.
+        if status >= 400 and isinstance(data, dict):
+            start_errors = data.get("start_date")
+            end_errors = data.get("end_date")
+            if start_errors or end_errors:
+                print("Retrying appointment update with PATCH due to date field validation on PUT")
+                return self._patch(f"schedule/appointment/{appointment_id}/", payload)
+
+        return status, data
 
     def cancel_appointment(self, appointment_id: int):
-        payload = {
-            "text": "Cita cancelada desde ClinicBot"
-        }
-        return self._patch(f"schedule/appointment/{appointment_id}/", payload)
+        return self._delete(f"schedule/appointment/{appointment_id}/")
