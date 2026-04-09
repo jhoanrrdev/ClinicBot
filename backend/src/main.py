@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timedelta
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Query, Body, Form
 from fastapi.responses import PlainTextResponse, Response
@@ -12,15 +13,11 @@ from pydantic import BaseModel
 
 from .database import SessionLocal, engine, Base
 from . import models
-
-try:
-    from src.integrations.sofisis_api import SofisisAPI
-except Exception:
-    from src.integrations.sofisis_api import SofisisAPI
+from src.integrations.sofisis_api import SofisisAPI
 
 load_dotenv()
 
-app = FastAPI(title="ClinicBot API", version="0.7.1")
+app = FastAPI(title="ClinicBot API", version="0.7.2")
 
 # ======================================================
 # CONFIG
@@ -105,6 +102,8 @@ def listar_usuarios(db: Session = Depends(get_db)):
 # ======================================================
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "clinicbot_verify_token")
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
+META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "").strip()
 
 
 @app.get("/webhook")
@@ -116,6 +115,35 @@ def verify_webhook(
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return PlainTextResponse(content=hub_challenge)
     return {"error": "Invalid verification token"}
+
+
+def send_meta_text_message(to: str, text: str):
+    if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
+        print("META send skipped: missing META_ACCESS_TOKEN or META_PHONE_NUMBER_ID")
+        return None
+
+    url = f"https://graph.facebook.com/v22.0/{META_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    try:
+        data = response.json()
+    except Exception:
+        data = response.text
+
+    print("META SEND STATUS:", response.status_code)
+    print("META SEND DATA:", data)
+    return response.status_code, data
 
 
 # ======================================================
@@ -975,6 +1003,13 @@ def process_message(sender: str, text: str, db: Session):
             if existing_appt:
                 appointment_id = existing_appt.get("id")
 
+                print("DEBUG REPROGRAMAR")
+                print("appointment_id:", appointment_id)
+                print("calendar_id:", calendar_id)
+                print("patient_id:", patient_id)
+                print("start_date:", start_date)
+                print("end_date:", end_date)
+
                 status_upd, upd_data = update_appointment_in_sofisis(
                     appointment_id=appointment_id,
                     calendar_id=calendar_id,
@@ -1074,12 +1109,17 @@ async def receive_webhook(payload: dict = Body(...), db: Session = Depends(get_d
         sender = message.get("from")
         text = message.get("text", {}).get("body", "")
 
+        if not sender or not text:
+            return {"status": "ignored", "reason": "unsupported message payload"}
+
         reply = process_message(sender, text, db)
+        send_result = send_meta_text_message(sender, reply)
 
         return {
             "status": "received",
             "reply": reply,
-            "session": SESSIONS.get(sender)
+            "session": SESSIONS.get(sender),
+            "meta_send": send_result
         }
 
     except Exception as e:
@@ -1103,12 +1143,16 @@ async def twilio_webhook(
 
     sender = From.replace("whatsapp:", "").replace("+", "").strip()
     text = Body.strip()
+    print("Normalized sender:", sender)
+    print("Normalized text:", text)
 
     reply = process_message(sender, text, db)
+    print("Bot reply:", reply)
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Message>{reply}</Message>
 </Response>"""
+    print("TwiML response:", twiml)
 
     return Response(content=twiml, media_type="application/xml")
