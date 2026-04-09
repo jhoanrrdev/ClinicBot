@@ -272,6 +272,7 @@ class SofisisAPI:
         calendar_user_sex: str,
         calendar_branch_name: str,
         text: str,
+        observations: str,
         start_date: str,
         end_date: str,
     ):
@@ -285,6 +286,7 @@ class SofisisAPI:
             "calendar__user__sex": calendar_user_sex,
             "calendar__branch__name": calendar_branch_name,
             "text": text,
+            "observations": observations,
             "start_date": start_date,
             "end_date": end_date,
         }
@@ -302,6 +304,7 @@ class SofisisAPI:
         calendar_user_sex: str,
         calendar_branch_name: str,
         text: str,
+        observations: str,
         start_date: str,
         end_date: str,
     ):
@@ -315,6 +318,7 @@ class SofisisAPI:
             "calendar__user__sex": calendar_user_sex,
             "calendar__branch__name": calendar_branch_name,
             "text": text,
+            "observations": observations,
             "start_date": start_date,
             "end_date": end_date,
         }

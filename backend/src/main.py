@@ -192,7 +192,13 @@ def get_or_create_session(sender: str):
     now = time.time()
 
     completed_at = session.get("booking_completed_at")
-    if completed_at and (now - completed_at) >= SESSION_TIMEOUT_SECONDS:
+    # Only auto-reset an expired completed session while the user is idle at the
+    # menu. Otherwise an active flow can get reset mid-conversation.
+    if (
+        completed_at
+        and session.get("state") == "MENU"
+        and (now - completed_at) >= SESSION_TIMEOUT_SECONDS
+    ):
         SESSIONS[sender] = new_session()
         session = SESSIONS[sender]
 
@@ -215,7 +221,8 @@ def menu_text():
         "1️⃣ Agendar cita\n"
         "2️⃣ Consultar mis citas\n"
         "3️⃣ Servicios\n"
-        "4️⃣ Horarios\n\n"
+        "4️⃣ Horarios\n"
+        "5️⃣ Terminar conversación\n\n"
         "Responde con un número."
     )
 
@@ -290,6 +297,54 @@ def is_canceled_appointment(appt) -> bool:
     return "cancelad" in text or "cancelad" in observations
 
 
+def get_patient_display_name(session: dict) -> str:
+    first_name = str(session.get("first_name") or "").strip()
+    last_name = str(session.get("last_name") or "").strip()
+    full_name = f"{first_name} {last_name}".strip()
+    if full_name:
+        return full_name
+
+    label = str(session.get("sofisis_patient_label") or "").strip()
+    if "|" in label:
+        candidate = label.split("|", 1)[0].strip()
+        if candidate:
+            return candidate
+
+    if label:
+        return label
+
+    identification = str(session.get("identification") or "").strip()
+    return identification or "Paciente ClinicBot"
+
+
+def build_clinicbot_observation(action: str, session: dict, extra: str = "") -> str:
+    movement_map = {
+        "book": "Cita agendada desde ClinicBot",
+        "reschedule": "Cita reprogramada desde ClinicBot",
+    }
+    parts = [movement_map.get(action, "Movimiento desde ClinicBot")]
+
+    identification = str(session.get("identification") or "").strip()
+    if identification:
+        parts.append(f"Identificacion: {identification}")
+
+    if extra:
+        parts.append(extra.strip())
+
+    return " | ".join(parts)
+
+
+def is_successful_delete(status_code: int, response_data) -> bool:
+    if status_code in [200, 202, 204]:
+        return True
+
+    if status_code == 404 and isinstance(response_data, dict):
+        detail = str(response_data.get("detail") or "").lower()
+        return "no encontrado" in detail or "not found" in detail
+
+    return False
+
+
 # ======================================================
 # HELPERS SOFISIS
 # ======================================================
@@ -360,6 +415,7 @@ def create_appointment_in_sofisis(
     calendar_user_sex: str,
     calendar_branch_name: str,
     text: str,
+    observations: str,
     start_date: str,
     end_date: str,
 ):
@@ -374,6 +430,7 @@ def create_appointment_in_sofisis(
         calendar_user_sex=calendar_user_sex,
         calendar_branch_name=calendar_branch_name,
         text=text,
+        observations=observations,
         start_date=start_date,
         end_date=end_date,
     )
@@ -395,6 +452,7 @@ def update_appointment_in_sofisis(
     calendar_user_sex: str,
     calendar_branch_name: str,
     text: str,
+    observations: str,
     start_date: str,
     end_date: str,
 ):
@@ -410,6 +468,7 @@ def update_appointment_in_sofisis(
         calendar_user_sex=calendar_user_sex,
         calendar_branch_name=calendar_branch_name,
         text=text,
+        observations=observations,
         start_date=start_date,
         end_date=end_date,
     )
@@ -537,6 +596,8 @@ def process_message(sender: str, text: str, db: Session):
 
     usuario = db.query(models.Usuario).filter(models.Usuario.telefono == sender).first()
     if not usuario:
+        SESSIONS[sender] = new_session()
+        session = SESSIONS[sender]
         usuario = models.Usuario(
             nombre="SinNombre",
             telefono=sender,
@@ -545,6 +606,20 @@ def process_message(sender: str, text: str, db: Session):
         db.add(usuario)
         db.commit()
         db.refresh(usuario)
+
+    # Persist consent across session resets so returning users are not asked
+    # for authorization again after they already accepted it.
+    db_consent = usuario.consentimiento
+    session_consent = session.get("consent")
+
+    if db_consent is None:
+        if session_consent is not None:
+            session["consent"] = None
+            session["state"] = "START"
+    elif session_consent is None or bool(session_consent) != bool(db_consent):
+        session["consent"] = bool(db_consent)
+        if session.get("state") == "START":
+            session["state"] = "MENU" if db_consent else "END"
 
     # --------------------------------------------------
     # CONSENTIMIENTO
@@ -582,6 +657,13 @@ def process_message(sender: str, text: str, db: Session):
                 "2️⃣ No acepto"
             )
 
+    if session["state"] == "END":
+        if text_lower in ["hola", "menu", "menú", "iniciar", "volver"]:
+            session["state"] = "MENU"
+            return "👋 Conversación reiniciada.\n\n" + menu_text()
+
+        return "👋 Conversación finalizada.\nSi deseas volver, escribe 'Hola'."
+
     # --------------------------------------------------
     # MENÚ
     # --------------------------------------------------
@@ -610,6 +692,10 @@ def process_message(sender: str, text: str, db: Session):
 
         if text_lower == "4":
             return "🕒 Horarios: Lunes a Viernes 8:00am - 6:00pm."
+
+        if text_lower in ["5", "salir", "terminar", "finalizar", "fin"]:
+            session["state"] = "END"
+            return "👋 Conversación finalizada.\nSi deseas volver más tarde, escribe 'Hola'."
 
         return menu_text()
 
@@ -705,7 +791,7 @@ def process_message(sender: str, text: str, db: Session):
 
         session["state"] = "MENU"
 
-        if status_cancel in [200, 202, 204]:
+        if is_successful_delete(status_cancel, data_cancel):
             mark_booking_completed(session)
             return "✅ Tu cita fue cancelada.\n\n" + menu_text()
 
@@ -848,7 +934,7 @@ def process_message(sender: str, text: str, db: Session):
             status_cancel, data_cancel = cancel_appointment_in_sofisis(appointment_id)
 
             session["state"] = "MENU"
-            if status_cancel in [200, 202, 204]:
+            if is_successful_delete(status_cancel, data_cancel):
                 mark_booking_completed(session)
                 return "✅ Tu cita fue cancelada.\n\n" + menu_text()
 
@@ -1003,6 +1089,7 @@ def process_message(sender: str, text: str, db: Session):
             doctor_cell = user_data.get("cell") or user_data.get("phone") or ""
             doctor_name = user_data.get("full_name") or user_data.get("label") or ""
             doctor_sex = normalize_sex_value(user_data.get("sex"))
+            patient_display_name = get_patient_display_name(session)
 
             if not doctor_cell:
                 session["state"] = "MENU"
@@ -1032,7 +1119,12 @@ def process_message(sender: str, text: str, db: Session):
                     calendar_user_full_name=doctor_name,
                     calendar_user_sex=doctor_sex,
                     calendar_branch_name=calendar_branch_name,
-                    text=f"Reprogramada desde ClinicBot - {session.get('identification', '').strip()}",
+                    text=patient_display_name,
+                    observations=build_clinicbot_observation(
+                        "reschedule",
+                        session,
+                        extra=f"Cita anterior ID: {appointment_id}",
+                    ),
                     start_date=start_date,
                     end_date=end_date,
                 )
@@ -1062,7 +1154,12 @@ def process_message(sender: str, text: str, db: Session):
                     calendar_user_full_name=doctor_name,
                     calendar_user_sex=doctor_sex,
                     calendar_branch_name=calendar_branch_name,
-                    text=f"Reprogramada desde ClinicBot - {session.get('identification', '').strip()}",
+                    text=patient_display_name,
+                    observations=build_clinicbot_observation(
+                        "reschedule",
+                        session,
+                        extra=f"Cita anterior ID: {appointment_id}",
+                    ),
                     start_date=start_date,
                     end_date=end_date,
                 )
@@ -1071,7 +1168,7 @@ def process_message(sender: str, text: str, db: Session):
                     status_cancel_old, cancel_old_data = cancel_appointment_in_sofisis(appointment_id)
                     mark_booking_completed(session)
 
-                    if status_cancel_old in [200, 202, 204]:
+                    if is_successful_delete(status_cancel_old, cancel_old_data):
                         return (
                             "✅ ¡Tu cita fue reprogramada en Sofisis!\n\n"
                             f"👤 Paciente: {session.get('sofisis_patient_label')}\n"
@@ -1104,7 +1201,8 @@ def process_message(sender: str, text: str, db: Session):
                 calendar_user_full_name=doctor_name,
                 calendar_user_sex=doctor_sex,
                 calendar_branch_name=calendar_branch_name,
-                text=f"ClinicBot - {session.get('identification', '').strip()}",
+                text=patient_display_name,
+                observations=build_clinicbot_observation("book", session),
                 start_date=start_date,
                 end_date=end_date,
             )
